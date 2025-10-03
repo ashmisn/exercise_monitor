@@ -1,15 +1,15 @@
+import base64
+import cv2
+import numpy as np
+import time
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
-import cv2
 import mediapipe as mp
-import numpy as np
-import base64
-import json
 
 # =========================================================================
-# 1. MEDIAPIPE INITIALIZATION (GLOBAL)
+# 1. MEDIAPIPE & FASTAPI SETUP
 # =========================================================================
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(
@@ -17,46 +17,50 @@ pose = mp_pose.Pose(
     min_tracking_confidence=0.5
 )
 
-# =========================================================================
-# 2. FASTAPI APP & MIDDLEWARE
-# =========================================================================
 app = FastAPI(title="AI Physiotherapy API")
 
+# Configure CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # Allows all origins for local development
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # =========================================================================
-# 3. DATA MODELS (Pydantic) & Exercise Plans
+# 2. DATA MODELS & CONFIGURATION
 # =========================================================================
-class AilmentRequest(BaseModel):
-    ailment: str
+class Landmark2D(BaseModel):
+    x: float
+    y: float
+    visibility: float = 1.0 # Assuming visibility is always 1.0 from normalized 2D list
 
 class FrameRequest(BaseModel):
     frame: str
     exercise_name: str
-    previous_state: Optional[dict] = None
+    # Previous state needs to store reps, stage, and last_rep_time for debounce
+    previous_state: Dict | None = None
 
-class Landmark2D(BaseModel):
-    x: float
-    y: float
-    visibility: float
+class AilmentRequest(BaseModel): # <-- Re-defined Ailment Request Model
+    ailment: str
 
-class SessionResult(BaseModel):
-    reps: int
-    feedback: List[Dict]
-    accuracy_score: float
-    state: Dict
-    drawing_landmarks: Optional[List[Landmark2D]] = None # NEW
-    current_angle: Optional[float] = None              # NEW
-    angle_coords: Optional[Dict] = None                # NEW (A, B, C points for drawing angle arc)
+# Exercise settings (simplified from your earlier context)
+EXERCISE_CONFIGS = {
+    "shoulder flexion": {
+        "min_angle": 90, 
+        "max_angle": 160,
+        "debounce": 1.5
+    },
+    "elbow flexion": {
+        "min_angle": 60,
+        "max_angle": 150,
+        "debounce": 1.5
+    }
+}
 
+# Dummy Exercise Plans for get_plan endpoint (based on previous context)
 EXERCISE_PLANS = {
-    # ... (Your EXERCISE_PLANS dictionary remains here) ...
     "shoulder injury": {
         "ailment": "shoulder injury",
         "exercises": [
@@ -77,18 +81,20 @@ EXERCISE_PLANS = {
     }
 }
 
-
 # =========================================================================
-# 4. UTILITY FUNCTIONS (Simplified for API use)
+# 3. UTILITY FUNCTIONS
 # =========================================================================
 
 def calculate_angle_2d(a, b, c):
-    """Calculates angle using 2D coordinates (better for visual feedback on screen)"""
-    a = np.array(a) # Point A (e.g., Hip/Shoulder)
-    b = np.array(b) # Point B (Vertex, e.g., Shoulder/Elbow)
-    c = np.array(c) # Point C (e.g., Elbow/Wrist)
+    """Calculates angle between three 2D points (A-B-C) where B is the vertex."""
+    a = np.array(a) 
+    b = np.array(b) # Vertex point
+    c = np.array(c) 
 
-    # Use 2D calculation for simpler planar movements
+    # Ensure points are not coincident (which would cause a zero division error)
+    if np.all(a == b) or np.all(c == b):
+        return 0.0 # Return 0 if points overlap
+
     radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
     angle = np.abs(radians * 180.0 / np.pi)
 
@@ -98,66 +104,71 @@ def calculate_angle_2d(a, b, c):
     return angle
 
 def get_2d_landmarks(landmarks):
-    """Extracts 2D landmarks for drawing on the frontend canvas."""
+    """Extracts 2D normalized landmarks and visibility for frontend drawing."""
     return [
         {"x": lm.x, "y": lm.y, "visibility": lm.visibility}
         for lm in landmarks
     ]
 
 # =========================================================================
-# 5. CORE ANALYSIS LOGIC
+# 4. EXERCISE ANALYSIS FUNCTIONS
 # =========================================================================
 
 def analyze_shoulder_flexion(landmarks):
-    # Landmarks for Shoulder Flexion (Angle at the Shoulder)
-    # The points for the angle calculation (Hip-Shoulder-Elbow)
-    P_HIP = [landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x, landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y]
-    P_SHOULDER = [landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x, landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y]
-    P_ELBOW = [landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].x, landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].y]
+    # Angle calculation: HIP (A) - SHOULDER (B) - ELBOW (C)
+    LM_HIP = mp_pose.PoseLandmark.LEFT_HIP.value
+    LM_SHOULDER = mp_pose.PoseLandmark.LEFT_SHOULDER.value
+    LM_ELBOW = mp_pose.PoseLandmark.LEFT_ELBOW.value
+    
+    # Simple visibility check for required landmarks (0.5 threshold)
+    if landmarks[LM_HIP].visibility < 0.5 or landmarks[LM_SHOULDER].visibility < 0.5 or landmarks[LM_ELBOW].visibility < 0.5:
+        return 0, {}, [{"type": "warning", "message": "Low visibility for shoulder/hip/elbow."}]
+
+    P_HIP = [landmarks[LM_HIP].x, landmarks[LM_HIP].y]
+    P_SHOULDER = [landmarks[LM_SHOULDER].x, landmarks[LM_SHOULDER].y]
+    P_ELBOW = [landmarks[LM_ELBOW].x, landmarks[LM_ELBOW].y]
 
     angle = calculate_angle_2d(P_HIP, P_SHOULDER, P_ELBOW)
     
-    # Coordinates needed for the angle arc drawing on frontend
     angle_coords = {
         "A": {"x": P_HIP[0], "y": P_HIP[1]},
-        "B": {"x": P_SHOULDER[0], "y": P_SHOULDER[1]},
+        "B": {"x": P_SHOULDER[0], "y": P_SHOULDER[1]}, 
         "C": {"x": P_ELBOW[0], "y": P_ELBOW[1]},
     }
-
-    feedback = []
-    if angle < 90:
-        feedback.append({"type": "correction", "message": "Raise your arm higher (Hip-Shoulder-Elbow angle should be smaller)"})
-    elif angle > 160:
-        feedback.append({"type": "encouragement", "message": "Arm fully relaxed - ready to lift"})
-
-    return angle, feedback, angle_coords
+    return angle, angle_coords, [] # Return 0 for feedback (handled globally)
 
 def analyze_elbow_flexion(landmarks):
-    # Landmarks for Elbow Flexion (Angle at the Elbow)
-    # The points for the angle calculation (Shoulder-Elbow-Wrist)
-    P_SHOULDER = [landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x, landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y]
-    P_ELBOW = [landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].x, landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].y]
-    P_WRIST = [landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].x, landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].y]
+    # Angle calculation: SHOULDER (A) - ELBOW (B) - WRIST (C)
+    LM_SHOULDER = mp_pose.PoseLandmark.LEFT_SHOULDER.value
+    LM_ELBOW = mp_pose.PoseLandmark.LEFT_ELBOW.value
+    LM_WRIST = mp_pose.PoseLandmark.LEFT_WRIST.value
+    
+    if landmarks[LM_SHOULDER].visibility < 0.5 or landmarks[LM_ELBOW].visibility < 0.5 or landmarks[LM_WRIST].visibility < 0.5:
+        return 0, {}, [{"type": "warning", "message": "Low visibility for elbow/wrist/shoulder."}]
+
+    P_SHOULDER = [landmarks[LM_SHOULDER].x, landmarks[LM_SHOULDER].y]
+    P_ELBOW = [landmarks[LM_ELBOW].x, landmarks[LM_ELBOW].y]
+    P_WRIST = [landmarks[LM_WRIST].x, landmarks[LM_WRIST].y]
 
     angle = calculate_angle_2d(P_SHOULDER, P_ELBOW, P_WRIST)
     
-    # Coordinates needed for the angle arc drawing on frontend
     angle_coords = {
         "A": {"x": P_SHOULDER[0], "y": P_SHOULDER[1]},
-        "B": {"x": P_ELBOW[0], "y": P_ELBOW[1]},
+        "B": {"x": P_ELBOW[0], "y": P_ELBOW[1]}, 
         "C": {"x": P_WRIST[0], "y": P_WRIST[1]},
     }
+    return angle, angle_coords, [] # Return 0 for feedback (handled globally)
 
-    feedback = []
-    if angle > 150:
-        feedback.append({"type": "correction", "message": "Bend your elbow more for full range"})
-    elif angle < 60:
-        feedback.append({"type": "encouragement", "message": "Deep bend achieved! Now extend slowly."})
-
-    return angle, feedback, angle_coords
+# Map exercise names to their analysis function
+ANALYSIS_MAP = {
+    "shoulder flexion": analyze_shoulder_flexion,
+    "shoulder abduction": analyze_shoulder_flexion, 
+    "elbow flexion": analyze_elbow_flexion,
+    "elbow extension": analyze_elbow_flexion,
+}
 
 # =========================================================================
-# 6. API ENDPOINTS
+# 5. API ENDPOINTS
 # =========================================================================
 
 @app.get("/")
@@ -166,18 +177,31 @@ def root():
 
 @app.post("/api/get_plan")
 def get_exercise_plan(request: AilmentRequest):
-    # ... (function body remains the same) ...
+    """Returns the static exercise plan for a given ailment."""
     ailment = request.ailment.lower()
     if ailment in EXERCISE_PLANS:
         return EXERCISE_PLANS[ailment]
+    
     available = list(EXERCISE_PLANS.keys())
     raise HTTPException(
         status_code=404,
         detail=f"Exercise plan not found for '{ailment}'. Available plans: {available}"
     )
 
+
 @app.post("/api/analyze_frame")
 def analyze_frame(request: FrameRequest):
+    # Initialize failure values
+    reps, stage, last_rep_time = 0, "down", 0
+    angle, angle_coords = 0, {}
+    feedback = []
+
+    # State initialization and retrieval (including debounce time)
+    current_state = request.previous_state or {"reps": 0, "stage": "down", "last_rep_time": 0}
+    reps = current_state.get("reps", 0)
+    stage = current_state.get("stage", "down")
+    last_rep_time = current_state.get("last_rep_time", 0)
+
     try:
         # 1. Decode Frame
         img_data = base64.b64decode(request.frame.split(',')[1])
@@ -188,76 +212,94 @@ def analyze_frame(request: FrameRequest):
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = pose.process(image_rgb)
 
-        current_state = request.previous_state or {"reps": 0, "stage": "down"}
-        reps = current_state.get("reps", 0)
-        stage = current_state.get("stage", "down")
         
         # --- Handle No Pose Detected ---
         if not results.pose_landmarks:
-            return {
-                "reps": reps,
-                "feedback": [{"type": "warning", "message": "No pose detected. Adjust camera view."}],
-                "accuracy_score": 0.0,
-                "state": current_state
-            }
-
-        landmarks = results.pose_landmarks.landmark
-        exercise_name = request.exercise_name.lower()
-        
-        # --- Analyze and Get Angle/Coords ---
-        if "shoulder flexion" in exercise_name or "shoulder abduction" in exercise_name:
-            angle, feedback, angle_coords = analyze_shoulder_flexion(landmarks)
-            MIN_ANGLE = 90
-            MAX_ANGLE = 160
-        elif "elbow flexion" in exercise_name or "elbow extension" in exercise_name:
-            angle, feedback, angle_coords = analyze_elbow_flexion(landmarks)
-            MIN_ANGLE = 60
-            MAX_ANGLE = 150
+            feedback.append({"type": "warning", "message": "No pose detected. Adjust camera view."})
         else:
-            angle = 0
-            feedback = [{"type": "warning", "message": "Exercise not recognized"}]
-            angle_coords = {}
-            MIN_ANGLE = 0
-            MAX_ANGLE = 0
+            landmarks = results.pose_landmarks.landmark
+            exercise_name = request.exercise_name.lower()
+            
+            # --- Configuration Lookup ---
+            config = EXERCISE_CONFIGS.get(exercise_name, {})
+            if not config:
+                feedback.append({"type": "warning", "message": f"Configuration not found for: {exercise_name}"})
+            else:
+                # --- Analyze Angle ---
+                analysis_func = ANALYSIS_MAP.get(exercise_name)
+                if analysis_func:
+                    angle, angle_coords, analysis_feedback = analysis_func(landmarks)
+                    feedback.extend(analysis_feedback) # Add visibility warnings
+                else:
+                    feedback.append({"type": "warning", "message": "Analysis function missing."})
 
-        # --- Rep Counting Logic (Adjusted to use MIN/MAX) ---
-        # Transition to UP stage (Contraction/Lift phase)
-        if angle < MIN_ANGLE + 10 and stage == "down":
-            stage = "up"
-            feedback.append({"type": "instruction", "message": "Hold contraction..."})
+                # --- NEW: DEBUG LOGGING FOR EVERY FRAME ---
+                print(f"DEBUG: Exercise={exercise_name}, ANGLE={round(angle, 1)}°, STAGE={stage}")
+                # ----------------------------------------
 
-        # Transition to DOWN stage (Extension/Return phase - Rep counted)
-        if angle > MAX_ANGLE - 10 and stage == "up":
-            stage = "down"
-            reps += 1
-            feedback.append({"type": "encouragement", "message": f"Rep {reps} completed! Return slowly."})
 
-        # --- Prepare Output Data ---
-        accuracy = min(100.0, (reps / 10.0) * 100) if reps > 0 else 0.0
+                # --- Rep Counting Logic (with Debounce) ---
+                if not analysis_feedback: # Only count if primary landmarks were visible
+                    MIN_ANGLE = config['min_angle']
+                    MAX_ANGLE = config['max_angle']
+                    DEBOUNCE_TIME = config['debounce']
+                    
+                    MIN_ANGLE_THRESHOLD = MIN_ANGLE + 10
+                    MAX_ANGLE_THRESHOLD = MAX_ANGLE - 10
+                    current_time = time.time()
+                    
+                    # 1. Transition to UP stage (Contraction/Lift phase)
+                    if angle < MIN_ANGLE_THRESHOLD and stage == "down":
+                        stage = "up"
+                        feedback.append({"type": "instruction", "message": "Hold contracted position."})
+
+                    # 2. Transition to DOWN stage (Extension/Return phase - Rep counted)
+                    if angle > MAX_ANGLE_THRESHOLD and stage == "up":
+                        if current_time - last_rep_time > DEBOUNCE_TIME:
+                            stage = "down"
+                            reps += 1
+                            last_rep_time = current_time # Update the last rep time
+                            feedback.append({"type": "encouragement", "message": f"Rep {reps} completed! Return slowly."})
+                            # --- SUCCESS LOGGING ---
+                            print(f"SUCCESS: REPS={reps}, STAGE={stage}, ANGLE={round(angle, 1)}°")
+                            # -----------------------
+                        else:
+                            feedback.append({"type": "warning", "message": "Too fast! Wait for the full return."})
+                    
+                    # If no stage transition, provide generic feedback based on angle position
+                    if not any(f['type'] != 'warning' for f in feedback):
+                        if angle > MAX_ANGLE_THRESHOLD:
+                            feedback.append({"type": "encouragement", "message": "Ready to start your next rep."})
+                        elif angle < MIN_ANGLE_THRESHOLD:
+                            feedback.append({"type": "encouragement", "message": "Hold the stretch!"})
+                        else:
+                            feedback.append({"type": "progress", "message": "Maintain controlled movement."})
         
-        # Extract 2D drawing data
-        drawing_landmarks = get_2d_landmarks(landmarks)
+        # --- Prepare Output Data ---
+        # If any major error occurred (like no pose), accuracy should be 0.0
+        accuracy = min(100.0, (reps / 10.0) * 100) if reps > 0 and results.pose_landmarks else 0.0
+        drawing_landmarks = get_2d_landmarks(landmarks) if results.pose_landmarks else []
 
         return {
             "reps": reps,
-            "feedback": feedback,
+            "feedback": feedback if feedback else [{"type": "progress", "message": "Processing..."}],
             "accuracy_score": round(accuracy, 2),
-            "state": {"reps": reps, "stage": stage, "angle": round(angle, 1)},
-            "drawing_landmarks": drawing_landmarks, # ADDED: Skeleton drawing points
-            "current_angle": round(angle, 1),       # ADDED: Current angle value
-            "angle_coords": angle_coords            # ADDED: A, B, C normalized coordinates for drawing the arc
+            "state": {"reps": reps, "stage": stage, "angle": round(angle, 1), "last_rep_time": last_rep_time},
+            "drawing_landmarks": drawing_landmarks,
+            "current_angle": round(angle, 1),
+            "angle_coords": angle_coords
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing frame: {str(e)}")
-
-# ... (The /api/progress/{user_id} endpoint remains the same) ...
+        # Catch any unexpected error and log it, returning a descriptive 500
+        print(f"CRITICAL ERROR in analyze_frame: {e}")
+        import traceback
+        traceback.print_exc() 
+        raise HTTPException(status_code=500, detail=f"Unexpected server error during analysis: {str(e)}")
 
 # =========================================================================
-# 7. MAIN EXECUTION
+# 6. MAIN EXECUTION
 # =========================================================================
 if __name__ == "__main__":
     import uvicorn
-    # The separate 'main()' code block (for calibration and logging) has been removed here,
-    # as it should be a separate script or integrated differently.
     uvicorn.run(app, host="0.0.0.0", port=8000)
