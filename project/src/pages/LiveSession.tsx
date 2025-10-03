@@ -1,5 +1,7 @@
 import React, { useRef, useState, useEffect } from 'react';
 import { Camera, StopCircle, Play, AlertCircle } from 'lucide-react';
+import { useAuth } from '../contexts/AuthContext'; // Original, correct import
+
 
 // --- INTERFACE DEFINITIONS ---
 interface Exercise {
@@ -96,9 +98,9 @@ const drawLandmarks = (
         const pA = { x: A.x * width, y: A.y * height };
         const pC = { x: C.x * width, y: C.y * height };
         
-        // Calculate the angle arc start and end points
-        const startAngle = Math.atan2(A.y * height - center.y, A.x * width - center.x);
-        const endAngle = Math.atan2(C.y * height - center.y, C.x * width - center.x);
+        // Calculate the angle arc start and end points (simplified for drawing overlay)
+        const startAngle = Math.atan2(pA.y - center.y, pA.x - center.x);
+        const endAngle = Math.atan2(pC.y - center.y, pC.x - center.x);
         
         let start = startAngle < 0 ? startAngle + 2 * Math.PI : startAngle;
         let end = endAngle < 0 ? endAngle + 2 * Math.PI : endAngle;
@@ -130,12 +132,12 @@ const drawLandmarks = (
 
 
 export const LiveSession: React.FC<LiveSessionProps> = ({ exercise, onComplete }) => {
+    const { user } = useAuth(); // Get authenticated user
     const videoRef = useRef<HTMLVideoElement>(null);
     const hiddenCanvasRef = useRef<HTMLCanvasElement>(null); 
     const drawingCanvasRef = useRef<HTMLCanvasElement>(null); 
     
     // CRITICAL FIX: Use useRef to store the state that needs to be accessed inside the interval
-    // This mutable ref holds the latest state returned by the API
     const sessionStateRef = useRef<any>({ 
         reps: 0, 
         stage: 'down', 
@@ -148,11 +150,48 @@ export const LiveSession: React.FC<LiveSessionProps> = ({ exercise, onComplete }
     const [reps, setReps] = useState(0);
     const [feedback, setFeedback] = useState<FeedbackItem[]>([]);
     const [accuracy, setAccuracy] = useState(0);
-    // REMOVED: const [sessionState, setSessionState] = useState<any>({ reps: 0, stage: 'down' });
     const [error, setError] = useState('');
     const [drawingData, setDrawingData] = useState<DrawingData | null>(null);
     
     const intervalRef = useRef<NodeJS.Timeout | null>(null);
+
+    // --- NEW: Save Session Result Function ---
+    const saveSessionResult = async (finalReps: number, finalAccuracy: number) => {
+        // Ensure user?.id is checked for robustness, especially in a real Supabase environment
+        if (!user?.id) {
+            console.error("Cannot save session: User ID is missing.");
+            return;
+        }
+
+        if (finalReps === 0) {
+            console.log("Session ended with 0 reps, not saving.");
+            return;
+        }
+        
+        try {
+            const response = await fetch('http://localhost:8000/api/save_session', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user_id: user.id, // Use the real authenticated user ID
+                    exercise_name: exercise.name,
+                    reps_completed: finalReps,
+                    accuracy_score: finalAccuracy,
+                }),
+            });
+
+            if (response.ok) {
+                console.log(`Successfully saved ${finalReps} reps for user ${user.id}.`);
+            } else {
+                const errorDetail = await response.json().catch(() => ({ detail: 'Unknown Save Error' }));
+                console.error('Failed to save session:', response.status, errorDetail.detail);
+            }
+        } catch (error) {
+            console.error('Network error while saving session:', error);
+        }
+    };
+    // ----------------------------------------
+
 
     // --- useEffect for Drawing ---
     useEffect(() => {
@@ -162,7 +201,6 @@ export const LiveSession: React.FC<LiveSessionProps> = ({ exercise, onComplete }
             const video = videoRef.current;
             
             if (ctx && video) {
-                // Ensure canvas size matches video size (important for correct scaling)
                 canvas.width = video.videoWidth;
                 canvas.height = video.videoHeight;
 
@@ -174,7 +212,6 @@ export const LiveSession: React.FC<LiveSessionProps> = ({ exercise, onComplete }
                 );
             }
         } else if (drawingCanvasRef.current) {
-            // Clear canvas when session stops or pose is lost
             drawingCanvasRef.current.getContext('2d')?.clearRect(0, 0, drawingCanvasRef.current.width, drawingCanvasRef.current.height);
         }
     }, [drawingData, isActive]);
@@ -183,14 +220,15 @@ export const LiveSession: React.FC<LiveSessionProps> = ({ exercise, onComplete }
 
     useEffect(() => {
         return () => {
-            stopSession();
+            // Ensure session is cleaned up on component unmount
+            stopSession(false); 
         };
     }, []);
 
     const captureAndAnalyze = async () => {
         if (!videoRef.current || !hiddenCanvasRef.current) return;
 
-        const canvas = hiddenCanvasRef.current; // Use the hidden canvas for capture
+        const canvas = hiddenCanvasRef.current;
         const video = videoRef.current;
 
         canvas.width = video.videoWidth;
@@ -199,12 +237,10 @@ export const LiveSession: React.FC<LiveSessionProps> = ({ exercise, onComplete }
         const ctx = canvas.getContext('2d');
         if (!ctx) return;
 
-        // Draw current video frame to the hidden canvas
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
         const frameData = canvas.toDataURL('image/jpeg', 0.8);
 
-        // CRITICAL: Use the LATEST state from the ref, which has been updated by the previous successful API call
         const latestState = sessionStateRef.current; 
 
         try {
@@ -216,12 +252,11 @@ export const LiveSession: React.FC<LiveSessionProps> = ({ exercise, onComplete }
                 body: JSON.stringify({
                     frame: frameData,
                     exercise_name: exercise.name,
-                    previous_state: latestState, // Pass the LATEST state
+                    previous_state: latestState, 
                 }),
             });
 
             if (!response.ok) {
-                // If API fails with 500, throw error to be caught below
                 const errorDetail = await response.json().catch(() => ({ detail: 'Unknown Server Error' }));
                 throw new Error(`Failed to analyze frame: ${errorDetail.detail}`);
             }
@@ -235,7 +270,6 @@ export const LiveSession: React.FC<LiveSessionProps> = ({ exercise, onComplete }
             setReps(data.reps);
             setFeedback(data.feedback);
             setAccuracy(data.accuracy_score);
-            // REMOVED: setSessionState(data.state); // No longer needed as ref is updated
 
             // --- PROCESS DRAWING DATA ---
             if (data.drawing_landmarks && data.angle_coords) {
@@ -249,19 +283,46 @@ export const LiveSession: React.FC<LiveSessionProps> = ({ exercise, onComplete }
                     }
                 });
             } else {
-                 setDrawingData(null);
+                setDrawingData(null);
             }
             // ----------------------------
 
 
             if (data.reps >= exercise.target_reps) {
-                 stopSession();
+                // When target reps are hit, stop session and save results.
+                stopSession(true); 
             }
         } catch (err) {
             console.error('Analysis error:', err);
             setError('Connection or Analysis Error. Check backend console.');
             setDrawingData(null);
         }
+    };
+
+    // Modified stopSession to accept a boolean flag for saving data
+    const stopSession = (shouldSave: boolean) => {
+        // Stop the interval
+        if (intervalRef.current) {
+            clearInterval(intervalRef.current);
+            intervalRef.current = null;
+        }
+
+        // Stop camera tracks
+        if (videoRef.current && videoRef.current.srcObject) {
+            const stream = videoRef.current.srcObject as MediaStream;
+            stream.getTracks().forEach((track) => track.stop());
+            videoRef.current.srcObject = null;
+        }
+
+        if (shouldSave) {
+            // Save the final result before resetting the state
+            saveSessionResult(sessionStateRef.current.reps, accuracy);
+        }
+        
+        // Reset state ref to initial values when stopping
+        sessionStateRef.current = { reps: 0, stage: 'down', angle: 0, last_rep_time: 0 };
+        setDrawingData(null); 
+        setIsActive(false);
     };
 
     const startCamera = async () => {
@@ -277,31 +338,12 @@ export const LiveSession: React.FC<LiveSessionProps> = ({ exercise, onComplete }
             setIsActive(true);
             setError('');
 
-            // CRITICAL FIX: The interval now calls the function directly, which uses the mutable ref
             intervalRef.current = setInterval(() => {
                 captureAndAnalyze();
             }, 500); 
         } catch (err) {
             setError('Failed to access camera. Please grant camera permissions.');
         }
-    };
-
-    const stopSession = () => {
-        if (intervalRef.current) {
-            clearInterval(intervalRef.current);
-            intervalRef.current = null;
-        }
-
-        if (videoRef.current && videoRef.current.srcObject) {
-            const stream = videoRef.current.srcObject as MediaStream;
-            stream.getTracks().forEach((track) => track.stop());
-            videoRef.current.srcObject = null;
-        }
-        
-        // Reset state ref to initial values when stopping
-        sessionStateRef.current = { reps: 0, stage: 'down', angle: 0, last_rep_time: 0 };
-        setDrawingData(null); 
-        setIsActive(false);
     };
 
     const getFeedbackColor = (type: string) => {
@@ -329,10 +371,14 @@ export const LiveSession: React.FC<LiveSessionProps> = ({ exercise, onComplete }
                             <p className="text-gray-600">{exercise.description}</p>
                         </div>
                         <button
-                            onClick={onComplete}
+                            // Calls stopSession but does NOT save, then calls onComplete to leave page
+                            onClick={() => {
+                                stopSession(false);
+                                onComplete();
+                            }} 
                             className="bg-gray-100 text-gray-700 px-6 py-3 rounded-lg font-medium hover:bg-gray-200 transition-all"
                         >
-                            End Session
+                            End Session (Don't Save)
                         </button>
                     </div>
 
@@ -384,11 +430,12 @@ export const LiveSession: React.FC<LiveSessionProps> = ({ exercise, onComplete }
 
                             {isActive && (
                                 <button
-                                    onClick={stopSession}
+                                    // Stops the session and saves the results
+                                    onClick={() => stopSession(true)}
                                     className="mt-4 w-full bg-red-600 text-white py-3 rounded-lg font-medium hover:bg-red-700 transition-all inline-flex items-center justify-center"
                                 >
                                     <StopCircle className="w-5 h-5 mr-2" />
-                                    Stop Session
+                                    Stop Session & Save
                                 </button>
                             )}
                         </div>
@@ -468,9 +515,11 @@ export const LiveSession: React.FC<LiveSessionProps> = ({ exercise, onComplete }
                                         Great job! Take a {exercise.rest_seconds} second rest.
                                     </p>
                                     <button
+                                        // This button means the user acknowledges the rest and starts the next set, 
+                                        // but the results of the *completed* set should have already been saved by stopSession(true)
                                         onClick={() => {
                                             setReps(0);
-                                            // Ensure the ref is also reset here!
+                                            // Reset the ref state to initial values
                                             sessionStateRef.current = { reps: 0, stage: 'down', angle: 0, last_rep_time: 0 };
                                         }}
                                         className="bg-green-600 text-white px-6 py-2 rounded-lg font-medium hover:bg-green-700 transition-all"
