@@ -1,7 +1,7 @@
 import React, { useRef, useState, useEffect } from 'react';
 import { Camera, StopCircle, Play, AlertCircle } from 'lucide-react';
 
-// --- NEW INTERFACES FOR DRAWING DATA ---
+// --- INTERFACE DEFINITIONS ---
 interface Exercise {
     name: string;
     description: string;
@@ -47,13 +47,12 @@ interface DrawingData {
     }
 }
 
-// MediaPipe Pose connection map (standard indices for drawing lines)
 const POSE_CONNECTIONS: [number, number][] = [
     [11, 12], [11, 13], [13, 15], [15, 17], [15, 19], [15, 21], [17, 19], [12, 14], [14, 16], [16, 18], [16, 20], [16, 22],
     [11, 23], [12, 24], [23, 24], [23, 25], [24, 26], [25, 27], [26, 28], [27, 29], [28, 30], [29, 31], [30, 32], [27, 31], [28, 32]
 ];
 
-// --- DRAWING UTILITY FUNCTION ---
+// --- DRAWING UTILITY FUNCTION (Outside Component) ---
 const drawLandmarks = (
     ctx: CanvasRenderingContext2D,
     drawingData: DrawingData,
@@ -98,8 +97,8 @@ const drawLandmarks = (
         const pC = { x: C.x * width, y: C.y * height };
         
         // Calculate the angle arc start and end points
-        const startAngle = Math.atan2(pA.y - center.y, pA.x - center.x);
-        const endAngle = Math.atan2(pC.y - center.y, pC.x - center.x);
+        const startAngle = Math.atan2(A.y * height - center.y, A.x * width - center.x);
+        const endAngle = Math.atan2(C.y * height - center.y, C.x * width - center.x);
         
         let start = startAngle < 0 ? startAngle + 2 * Math.PI : startAngle;
         let end = endAngle < 0 ? endAngle + 2 * Math.PI : endAngle;
@@ -130,20 +129,28 @@ const drawLandmarks = (
 // ----------------------------------------------------
 
 
-export const LiveSession: React.FC<LiveSessionProps> = ({ plan, exercise, onComplete }) => {
+export const LiveSession: React.FC<LiveSessionProps> = ({ exercise, onComplete }) => {
     const videoRef = useRef<HTMLVideoElement>(null);
-    // Renamed original canvasRef (now hiddenCanvasRef) for capturing
     const hiddenCanvasRef = useRef<HTMLCanvasElement>(null); 
-    // New ref for the drawing overlay canvas
     const drawingCanvasRef = useRef<HTMLCanvasElement>(null); 
     
+    // CRITICAL FIX: Use useRef to store the state that needs to be accessed inside the interval
+    // This mutable ref holds the latest state returned by the API
+    const sessionStateRef = useRef<any>({ 
+        reps: 0, 
+        stage: 'down', 
+        angle: 0, 
+        last_rep_time: 0 
+    }); 
+
+    // Use useState for UI rendering only
     const [isActive, setIsActive] = useState(false);
     const [reps, setReps] = useState(0);
     const [feedback, setFeedback] = useState<FeedbackItem[]>([]);
     const [accuracy, setAccuracy] = useState(0);
-    const [sessionState, setSessionState] = useState<any>({ reps: 0, stage: 'down' });
+    // REMOVED: const [sessionState, setSessionState] = useState<any>({ reps: 0, stage: 'down' });
     const [error, setError] = useState('');
-    const [drawingData, setDrawingData] = useState<DrawingData | null>(null); // NEW STATE for drawing
+    const [drawingData, setDrawingData] = useState<DrawingData | null>(null);
     
     const intervalRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -180,6 +187,83 @@ export const LiveSession: React.FC<LiveSessionProps> = ({ plan, exercise, onComp
         };
     }, []);
 
+    const captureAndAnalyze = async () => {
+        if (!videoRef.current || !hiddenCanvasRef.current) return;
+
+        const canvas = hiddenCanvasRef.current; // Use the hidden canvas for capture
+        const video = videoRef.current;
+
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+
+        // Draw current video frame to the hidden canvas
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        const frameData = canvas.toDataURL('image/jpeg', 0.8);
+
+        // CRITICAL: Use the LATEST state from the ref, which has been updated by the previous successful API call
+        const latestState = sessionStateRef.current; 
+
+        try {
+            const response = await fetch('http://localhost:8000/api/analyze_frame', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    frame: frameData,
+                    exercise_name: exercise.name,
+                    previous_state: latestState, // Pass the LATEST state
+                }),
+            });
+
+            if (!response.ok) {
+                // If API fails with 500, throw error to be caught below
+                const errorDetail = await response.json().catch(() => ({ detail: 'Unknown Server Error' }));
+                throw new Error(`Failed to analyze frame: ${errorDetail.detail}`);
+            }
+
+            const data = await response.json();
+
+            // CRITICAL FIX: Update the mutable ref with the *entire* state returned by the API
+            sessionStateRef.current = data.state;
+
+            // Update local state (used for rendering UI elements like Reps/Accuracy)
+            setReps(data.reps);
+            setFeedback(data.feedback);
+            setAccuracy(data.accuracy_score);
+            // REMOVED: setSessionState(data.state); // No longer needed as ref is updated
+
+            // --- PROCESS DRAWING DATA ---
+            if (data.drawing_landmarks && data.angle_coords) {
+                setDrawingData({
+                    landmarks: data.drawing_landmarks,
+                    angleData: {
+                        angle: data.current_angle,
+                        A: data.angle_coords.A,
+                        B: data.angle_coords.B,
+                        C: data.angle_coords.C,
+                    }
+                });
+            } else {
+                 setDrawingData(null);
+            }
+            // ----------------------------
+
+
+            if (data.reps >= exercise.target_reps) {
+                 stopSession();
+            }
+        } catch (err) {
+            console.error('Analysis error:', err);
+            setError('Connection or Analysis Error. Check backend console.');
+            setDrawingData(null);
+        }
+    };
+
     const startCamera = async () => {
         try {
             const stream = await navigator.mediaDevices.getUserMedia({
@@ -193,8 +277,7 @@ export const LiveSession: React.FC<LiveSessionProps> = ({ plan, exercise, onComp
             setIsActive(true);
             setError('');
 
-            // Note: The capture rate is currently 500ms (2 FPS). You might want to increase this (e.g., 100ms for 10 FPS)
-            // for smoother real-time feedback, but check API performance.
+            // CRITICAL FIX: The interval now calls the function directly, which uses the mutable ref
             intervalRef.current = setInterval(() => {
                 captureAndAnalyze();
             }, 500); 
@@ -214,79 +297,11 @@ export const LiveSession: React.FC<LiveSessionProps> = ({ plan, exercise, onComp
             stream.getTracks().forEach((track) => track.stop());
             videoRef.current.srcObject = null;
         }
-
-        setDrawingData(null); // Clear drawing data
+        
+        // Reset state ref to initial values when stopping
+        sessionStateRef.current = { reps: 0, stage: 'down', angle: 0, last_rep_time: 0 };
+        setDrawingData(null); 
         setIsActive(false);
-    };
-
-    const captureAndAnalyze = async () => {
-        if (!videoRef.current || !hiddenCanvasRef.current) return;
-
-        const canvas = hiddenCanvasRef.current; // Use the hidden canvas for capture
-        const video = videoRef.current;
-
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return;
-
-        // Draw current video frame to the hidden canvas
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-        const frameData = canvas.toDataURL('image/jpeg', 0.8);
-
-        try {
-            const response = await fetch('http://localhost:8000/api/analyze_frame', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    frame: frameData,
-                    exercise_name: exercise.name,
-                    previous_state: sessionState,
-                }),
-            });
-
-            if (!response.ok) {
-                throw new Error('Failed to analyze frame');
-            }
-
-            const data = await response.json();
-
-            setReps(data.reps);
-            setFeedback(data.feedback);
-            setAccuracy(data.accuracy_score);
-            setSessionState(data.state);
-
-            // --- PROCESS DRAWING DATA ---
-            if (data.drawing_landmarks && data.angle_coords) {
-                setDrawingData({
-                    landmarks: data.drawing_landmarks,
-                    angleData: {
-                        angle: data.current_angle,
-                        A: data.angle_coords.A,
-                        B: data.angle_coords.B,
-                        C: data.angle_coords.C,
-                    }
-                });
-            } else {
-                 setDrawingData(null);
-                 // If no pose detected, the backend should send a warning feedback
-            }
-            // ----------------------------
-
-
-            if (data.reps >= exercise.target_reps) {
-                // If you want to automatically stop after completing reps
-                // stopSession();
-                // You might want to remove stopSession() here and let the user click "Start Next Set"
-            }
-        } catch (err) {
-            console.error('Analysis error:', err);
-            setDrawingData(null);
-        }
     };
 
     const getFeedbackColor = (type: string) => {
@@ -455,7 +470,8 @@ export const LiveSession: React.FC<LiveSessionProps> = ({ plan, exercise, onComp
                                     <button
                                         onClick={() => {
                                             setReps(0);
-                                            setSessionState({ reps: 0, stage: 'down' });
+                                            // Ensure the ref is also reset here!
+                                            sessionStateRef.current = { reps: 0, stage: 'down', angle: 0, last_rep_time: 0 };
                                         }}
                                         className="bg-green-600 text-white px-6 py-2 rounded-lg font-medium hover:bg-green-700 transition-all"
                                     >

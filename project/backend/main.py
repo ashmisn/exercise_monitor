@@ -48,7 +48,7 @@ class AilmentRequest(BaseModel): # <-- Re-defined Ailment Request Model
 # Exercise settings (simplified from your earlier context)
 EXERCISE_CONFIGS = {
     "shoulder flexion": {
-        "min_angle": 90, 
+        "min_angle": 30, 
         "max_angle": 160,
         "debounce": 1.5
     },
@@ -197,16 +197,39 @@ def analyze_frame(request: FrameRequest):
     feedback = []
 
     # State initialization and retrieval (including debounce time)
+    # The 'stage' is the most critical piece of persistent state.
     current_state = request.previous_state or {"reps": 0, "stage": "down", "last_rep_time": 0}
     reps = current_state.get("reps", 0)
     stage = current_state.get("stage", "down")
     last_rep_time = current_state.get("last_rep_time", 0)
 
+    # --- NEW: LOG THE INCOMING STAGE FOR DEBUGGING ---
+    print(f"INCOMING STATE: Reps={reps}, Stage={stage}, LastAngle={current_state.get('angle', 'N/A')}")
+    # ---------------------------------------------------
+
     try:
         # 1. Decode Frame
-        img_data = base64.b64decode(request.frame.split(',')[1])
+        # Extract base64 data after the header (e.g., "data:image/jpeg;base64,")
+        header, encoded = request.frame.split(',', 1) if ',' in request.frame else ('', request.frame)
+        
+        img_data = base64.b64decode(encoded)
         nparr = np.frombuffer(img_data, np.uint8)
         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        # --- CRITICAL FRAME INTEGRITY CHECK ---
+        if frame is None or frame.size == 0:
+            # If decoding fails, return graceful failure.
+            print(f"WARNING: Frame decoding resulted in an empty frame. Received data size: {len(img_data)} bytes.")
+            return {
+                "reps": reps,
+                "feedback": [{"type": "warning", "message": "Video stream data corrupted or failed to decode."}],
+                "accuracy_score": 0.0,
+                "state": {"reps": reps, "stage": stage, "angle": 0, "last_rep_time": last_rep_time},
+                "drawing_landmarks": [],
+                "current_angle": 0,
+                "angle_coords": {}
+            }
+        # ------------------------------------------
 
         # 2. Process with MediaPipe
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -233,29 +256,34 @@ def analyze_frame(request: FrameRequest):
                 else:
                     feedback.append({"type": "warning", "message": "Analysis function missing."})
 
-                # --- NEW: DEBUG LOGGING FOR EVERY FRAME ---
+                # --- DEBUG LOGGING FOR EVERY FRAME ---
                 print(f"DEBUG: Exercise={exercise_name}, ANGLE={round(angle, 1)}°, STAGE={stage}")
                 # ----------------------------------------
 
 
-                # --- Rep Counting Logic (with Debounce) ---
+                # --- Rep Counting Logic (Robust to Stage Sync Errors) ---
                 if not analysis_feedback: # Only count if primary landmarks were visible
                     MIN_ANGLE = config['min_angle']
                     MAX_ANGLE = config['max_angle']
                     DEBOUNCE_TIME = config['debounce']
                     
-                    MIN_ANGLE_THRESHOLD = MIN_ANGLE + 10
-                    MAX_ANGLE_THRESHOLD = MAX_ANGLE - 10
+                    # Thresholds derived from config
+                    MIN_ANGLE_THRESHOLD = MIN_ANGLE + 10 # e.g., 30 + 10 = 40 (Top of movement)
+                    MAX_ANGLE_THRESHOLD = MAX_ANGLE - 10 # e.g., 160 - 10 = 150 (Bottom of movement)
                     current_time = time.time()
                     
-                    # 1. Transition to UP stage (Contraction/Lift phase)
-                    if angle < MIN_ANGLE_THRESHOLD and stage == "down":
+                    # --- CORE LOGIC FIX ---
+
+                    # If the angle is low, we mark the *intention* to complete the lift (regardless of stage sync errors)
+                    if angle < MIN_ANGLE_THRESHOLD:
                         stage = "up"
                         feedback.append({"type": "instruction", "message": "Hold contracted position."})
-
-                    # 2. Transition to DOWN stage (Extension/Return phase - Rep counted)
+                    
+                    # 1. Check for Rep Completion (Return to Max Angle)
+                    # This check only fires if the stage is currently marked 'up' (meaning MIN was hit recently)
                     if angle > MAX_ANGLE_THRESHOLD and stage == "up":
                         if current_time - last_rep_time > DEBOUNCE_TIME:
+                            # Rep counted! Reset state to 'down' for next rep cycle
                             stage = "down"
                             reps += 1
                             last_rep_time = current_time # Update the last rep time
@@ -271,7 +299,8 @@ def analyze_frame(request: FrameRequest):
                         if angle > MAX_ANGLE_THRESHOLD:
                             feedback.append({"type": "encouragement", "message": "Ready to start your next rep."})
                         elif angle < MIN_ANGLE_THRESHOLD:
-                            feedback.append({"type": "encouragement", "message": "Hold the stretch!"})
+                            # This message is already covered by the stage="up" block above, but serves as a general reminder
+                            pass 
                         else:
                             feedback.append({"type": "progress", "message": "Maintain controlled movement."})
         
@@ -284,6 +313,7 @@ def analyze_frame(request: FrameRequest):
             "reps": reps,
             "feedback": feedback if feedback else [{"type": "progress", "message": "Processing..."}],
             "accuracy_score": round(accuracy, 2),
+            # CRITICAL: Return the UPDATED state to the frontend
             "state": {"reps": reps, "stage": stage, "angle": round(angle, 1), "last_rep_time": last_rep_time},
             "drawing_landmarks": drawing_landmarks,
             "current_angle": round(angle, 1),
